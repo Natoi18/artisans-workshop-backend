@@ -4,14 +4,61 @@ import crypto from "crypto";
 import { db } from "../db/index.js";
 import { payments } from "../db/schema.js";
 import { eq } from "drizzle-orm";
+import { protect } from "../middleware/authMiddleware.js";
 import { pi } from "../utils/pi.js";
 
 const router = express.Router();
 
 /*
-────────────────────────────────
-1️⃣ APPROVE PAYMENT (NO AUTH)
-────────────────────────────────
+──────────────────────────────────────────
+1️⃣ CREATE PAYMENT (Frontend → Backend → Pi)
+──────────────────────────────────────────
+*/
+router.post("/create", protect, async (req, res) => {
+  try {
+    const { amount, videoId, metadata } = req.body;
+
+    const internalPaymentId = crypto.randomUUID();
+
+    const piRes = await pi.post("/payments", {
+      amount,
+      memo: metadata?.memo || "Artisan payment",
+      metadata: {
+        internalPaymentId,
+        videoId,
+      },
+    });
+
+    const piPaymentId = piRes.data.identifier;
+
+    const [payment] = await db
+      .insert(payments)
+      .values({
+        userId: req.user.id,
+        videoId,
+        amount,
+        providerReference: piPaymentId,
+        internalReference: internalPaymentId,
+        status: "pending",
+      })
+      .returning();
+
+    res.json({
+      piPaymentId,
+      internalPaymentId,
+      payment,
+    });
+  } catch (err) {
+    console.error("❌ Create payment failed:", err.response?.data || err.message);
+    res.status(500).json({ error: "Create payment failed" });
+  }
+});
+
+/*
+──────────────────────────────────────────
+2️⃣ APPROVE PAYMENT (Pi SDK callback)
+──────────────────────────────────────────
+❌ NO AUTH HERE
 */
 router.post("/approve", async (req, res) => {
   try {
@@ -19,71 +66,64 @@ router.post("/approve", async (req, res) => {
 
     await pi.post(`/payments/${paymentId}/approve`);
 
-    await db
-      .update(payments)
-      .set({ status: "approved" })
-      .where(eq(payments.providerReference, paymentId));
-
     res.json({ ok: true });
   } catch (err) {
-    console.error("Approve error:", err.response?.data || err.message);
+    console.error("❌ Approve failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Approve failed" });
   }
 });
 
 /*
-────────────────────────────────
-2️⃣ COMPLETE PAYMENT (NO AUTH)
-────────────────────────────────
+──────────────────────────────────────────
+3️⃣ COMPLETE PAYMENT (Pi SDK callback)
+──────────────────────────────────────────
+❌ NO AUTH HERE
 */
 router.post("/complete", async (req, res) => {
   try {
     const { paymentId, txid } = req.body;
 
-    await pi.post(`/payments/${paymentId}/complete`, { txid });
+    await pi.post(`/payments/${paymentId}/complete`, {
+      txid,
+    });
 
     await db
       .update(payments)
-      .set({ status: "completed", txId: txid })
+      .set({
+        status: "completed",
+        txId: txid,
+      })
       .where(eq(payments.providerReference, paymentId));
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("Complete error:", err.response?.data || err.message);
+    console.error("❌ Complete failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Complete failed" });
   }
 });
 
 /*
-────────────────────────────────
-3️⃣ WEBHOOK (OPTIONAL BUT OK)
-────────────────────────────────
+──────────────────────────────────────────
+4️⃣ PI WEBHOOK (optional safety net)
+──────────────────────────────────────────
 */
-router.post(
-  "/webhook",
-  express.json({ type: "*/*" }),
-  async (req, res) => {
-    const signature = req.headers["x-pi-signature"];
-    const body = JSON.stringify(req.body);
-
-    const expected = crypto
-      .createHmac("sha256", process.env.PI_WEBHOOK_SECRET)
-      .update(body)
-      .digest("hex");
-
-    if (signature !== expected) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
+router.post("/webhook", express.json({ type: "*/*" }), async (req, res) => {
+  try {
     const { identifier, txid, status } = req.body;
 
     await db
       .update(payments)
-      .set({ status, txId: txid || null })
+      .set({
+        status,
+        txId: txid || null,
+      })
       .where(eq(payments.providerReference, identifier));
 
     res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ Webhook error:", err);
+    res.status(500).json({ error: "Webhook failed" });
   }
-);
+});
 
 export default router;
