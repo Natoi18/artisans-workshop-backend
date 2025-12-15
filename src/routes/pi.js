@@ -83,15 +83,21 @@ router.post("/complete", async (req, res) => {
   try {
     const { paymentId, txid } = req.body;
 
-    await pi.post(`/payments/${paymentId}/complete`, {
-      txid,
-    });
+    // ✅ Call Pi complete WITHOUT txid in sandbox
+    if (process.env.PI_ENV === "sandbox") {
+      await pi.post(`/payments/${paymentId}/complete`);
+    } else {
+      // ✅ Production requires txid
+      await pi.post(`/payments/${paymentId}/complete`, {
+        txid,
+      });
+    }
 
     await db
       .update(payments)
       .set({
         status: "completed",
-        txId: txid,
+        txId: txid || null,
       })
       .where(eq(payments.providerReference, paymentId));
 
@@ -101,6 +107,7 @@ router.post("/complete", async (req, res) => {
     res.status(500).json({ error: "Complete failed" });
   }
 });
+
 
 /*
 ──────────────────────────────────────────
@@ -125,5 +132,7 @@ router.post("/webhook", express.json({ type: "*/*" }), async (req, res) => {
     res.status(500).json({ error: "Webhook failed" });
   }
 });
+console.log("🔑 PI_ENV:", process.env.PI_ENV);
+console.log("🔑 PI_API_KEY exists:", !!process.env.PI_API_KEY);
 
 export default router;
