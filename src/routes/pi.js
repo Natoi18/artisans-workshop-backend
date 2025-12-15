@@ -1,67 +1,101 @@
 // src/routes/pi.js
 import express from "express";
 import crypto from "crypto";
+import axios from "axios";
 import { db } from "../db/index.js";
 import { payments } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { protect } from "../middleware/authMiddleware.js";
-import { pi } from "../utils/pi.js";   // ✅ Pi Network REST API client
 
 const router = express.Router();
 
+const PI_API_URL = "https://api.minepi.com";
+const PI_API_KEY = process.env.PI_API_KEY;
+
 /*
 ──────────────────────────────────────────
- 1️⃣ CREATE PAYMENT (Backend → Pi API → DB)
+1️⃣ APPROVE PAYMENT (REQUIRED)
+Frontend → Pi → Backend
 ──────────────────────────────────────────
 */
-router.post("/create", protect, async (req, res) => {
+router.post("/approve", protect, async (req, res) => {
+  const { paymentId } = req.body;
+
+  if (!paymentId) {
+    return res.status(400).json({ error: "Missing paymentId" });
+  }
+
   try {
-    const { amount, videoId, metadata } = req.body;
+    // Approve on Pi server
+    const response = await axios.post(
+      `${PI_API_URL}/v2/payments/${paymentId}/approve`,
+      {},
+      {
+        headers: {
+          Authorization: `Key ${PI_API_KEY}`,
+        },
+      }
+    );
 
-    // Generate your internal payment ID
-    const internalPaymentId = crypto.randomUUID();
+    // Save / update DB
+    await db.insert(payments).values({
+      userId: req.user.id,
+      providerReference: paymentId,
+      internalReference: crypto.randomUUID(),
+      amount: response.data.amount,
+      status: "approved",
+    }).onConflictDoNothing();
 
-    // 1️⃣ Create payment on Pi Server
-    const piPayment = await pi.post("/payments", {
-      amount,
-      user_uid: req.user.id,   // Pioneer UID (frontend passes this)
-      metadata: metadata || {}, // optional
-    });
-
-    const piPaymentId = piPayment.data.identifier; // Pi payment reference
-
-    // 2️⃣ Save to your database
-    const [record] = await db
-      .insert(payments)
-      .values({
-        userId: req.user.id,
-        videoId,
-        amount,
-        providerReference: piPaymentId, // store Pi payment ID
-        internalReference: internalPaymentId, // your ID
-        status: "pending",
-      })
-      .returning();
-
-    // 3️⃣ Return both IDs to frontend
-    res.json({
-      ok: true,
-      piPaymentId,
-      internalPaymentId,
-      payment: record,
-    });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("Create payment failed:", err.response?.data || err.message);
-    res.status(500).json({
-      error: "Payment creation failed",
-      details: err.response?.data || err.message,
-    });
+    console.error("❌ Pi approve failed:", err.response?.data || err.message);
+    res.status(500).json({ error: "Approve failed" });
   }
 });
 
 /*
 ──────────────────────────────────────────
- 2️⃣ PI WEBHOOK (Pi → Backend → DB)
+2️⃣ COMPLETE PAYMENT (REQUIRED)
+Frontend → Pi → Backend
+──────────────────────────────────────────
+*/
+router.post("/complete", protect, async (req, res) => {
+  const { paymentId, txid } = req.body;
+
+  if (!paymentId || !txid) {
+    return res.status(400).json({ error: "Missing paymentId or txid" });
+  }
+
+  try {
+    await axios.post(
+      `${PI_API_URL}/v2/payments/${paymentId}/complete`,
+      { txid },
+      {
+        headers: {
+          Authorization: `Key ${PI_API_KEY}`,
+        },
+      }
+    );
+
+    await db
+      .update(payments)
+      .set({
+        status: "completed",
+        txId: txid,
+      })
+      .where(eq(payments.providerReference, paymentId));
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ Pi complete failed:", err.response?.data || err.message);
+    res.status(500).json({ error: "Completion failed" });
+  }
+});
+
+/*
+──────────────────────────────────────────
+3️⃣ PI WEBHOOK (OPTIONAL BUT GOOD)
+Pi → Backend → DB
 ──────────────────────────────────────────
 */
 router.post(
@@ -71,54 +105,44 @@ router.post(
     const signature = req.headers["x-pi-signature"];
     const body = JSON.stringify(req.body);
 
-    // Validate webhook using HMAC SHA-256
     const expected = crypto
       .createHmac("sha256", process.env.PI_WEBHOOK_SECRET)
       .update(body)
       .digest("hex");
 
     if (signature !== expected) {
-      console.log("❌ Invalid Pi Webhook signature");
       return res.status(401).json({ error: "Invalid signature" });
     }
 
-    try {
-      const { identifier, txid, status } = req.body; // Pi sends payment ID as "identifier"
+    const { identifier, txid, status } = req.body;
 
-      await db
-        .update(payments)
-        .set({
-          status,
-          txId: txid || null,
-        })
-        .where(eq(payments.providerReference, identifier));
+    await db
+      .update(payments)
+      .set({
+        status,
+        txId: txid || null,
+      })
+      .where(eq(payments.providerReference, identifier));
 
-      res.json({ ok: true });
-    } catch (err) {
-      console.error("Webhook error:", err);
-      res.status(500).json({ error: "Webhook update failed" });
-    }
+    res.json({ ok: true });
   }
 );
 
 /*
 ──────────────────────────────────────────
- 3️⃣ CHECK PAYMENT STATUS
+4️⃣ CHECK PAYMENT STATUS
 ──────────────────────────────────────────
 */
 router.get("/status/:paymentId", protect, async (req, res) => {
-  try {
-    const paymentId = req.params.paymentId;
+  const { paymentId } = req.params;
 
-    const [result] = await db
-      .select()
-      .from(payments)
-      .where(eq(payments.providerReference, paymentId));
+  const [payment] = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.providerReference, paymentId));
 
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: "Status fetch failed" });
-  }
+  res.json(payment);
 });
 
 export default router;
+

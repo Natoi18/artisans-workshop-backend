@@ -13,10 +13,16 @@ import piLoginRoutes from "./routes/piLogin.js";
 import attachSocket from "./socket.js";
 
 const app = express();
+
 app.use(cors({
-  origin: "http://localhost:3000",
+  origin: [
+    "http://localhost:3000",
+    "https://artisans-workshop-frontend.vercel.app",
+    "https://sandbox.minepi.com"
+  ],
   credentials: true,
 }));
+
 app.use(express.json());
 
 app.use("/api/auth", authRoutes);
@@ -26,12 +32,15 @@ app.use("/api/agora", agoraRoutes);
 app.use("/api/pi", piRoutes);
 app.use("/api/pi", piLoginRoutes);
 
-app.get("/", (req, res) => res.send("Expert Artisan Backend Running..."));
+app.get("/", (_, res) =>
+  res.send("Expert Artisan Backend Running...")
+);
 
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// attach socket.io
-const io = attachSocket(server);
+attachSocket(server);
 
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () =>
+  console.log(`✅ Server running on port ${PORT}`)
+);
