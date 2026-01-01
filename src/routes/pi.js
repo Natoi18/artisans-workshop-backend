@@ -1,4 +1,3 @@
-// src/routes/pi.js
 import express from "express";
 import crypto from "crypto";
 import { db } from "../db/index.js";
@@ -12,15 +11,23 @@ const router = express.Router();
 /*
 ──────────────────────────────────────────
 1️⃣ CREATE PAYMENT
-Frontend → Backend → Pi API
 ──────────────────────────────────────────
 */
 router.post("/create", protect, async (req, res) => {
   try {
     const { amount, videoId, metadata } = req.body;
 
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: "Invalid amount" });
+    // 🔒 Prevent duplicate pending payments
+    const existing = await db
+      .select()
+      .from(payments)
+      .where(eq(payments.userId, req.user.id))
+      .limit(1);
+
+    if (existing.length && existing[0].status === "pending") {
+      return res.status(400).json({
+        error: "You have a pending payment. Please complete it first.",
+      });
     }
 
     const internalPaymentId = crypto.randomUUID();
@@ -41,7 +48,7 @@ router.post("/create", protect, async (req, res) => {
       .insert(payments)
       .values({
         userId: req.user.id,
-        videoId: videoId || null,
+        videoId,
         amount,
         providerReference: piPaymentId,
         internalReference: internalPaymentId,
@@ -50,13 +57,11 @@ router.post("/create", protect, async (req, res) => {
       .returning();
 
     res.json({
-      ok: true,
       piPaymentId,
       internalPaymentId,
-      payment,
     });
   } catch (err) {
-    console.error("❌ CREATE PAYMENT FAILED:", err.response?.data || err.message);
+    console.error("❌ Create payment failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Create payment failed" });
   }
 });
@@ -64,28 +69,17 @@ router.post("/create", protect, async (req, res) => {
 /*
 ──────────────────────────────────────────
 2️⃣ APPROVE PAYMENT
-Pi SDK → Backend
-(NO AUTH — Pi SDK CALL)
 ──────────────────────────────────────────
 */
 router.post("/approve", async (req, res) => {
   try {
     const { paymentId } = req.body;
 
-    if (!paymentId) {
-      return res.status(400).json({ error: "Missing paymentId" });
-    }
-
     await pi.post(`/payments/${paymentId}/approve`);
-
-    await db
-      .update(payments)
-      .set({ status: "approved" })
-      .where(eq(payments.providerReference, paymentId));
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("❌ APPROVE FAILED:", err.response?.data || err.message);
+    console.error("❌ Approve failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Approve failed" });
   }
 });
@@ -93,34 +87,16 @@ router.post("/approve", async (req, res) => {
 /*
 ──────────────────────────────────────────
 3️⃣ COMPLETE PAYMENT
-Pi SDK → Backend
-(NO AUTH — Pi SDK CALL)
 ──────────────────────────────────────────
 */
 router.post("/complete", async (req, res) => {
   try {
     const { paymentId, txid } = req.body;
 
-    if (!paymentId) {
-      return res.status(400).json({ error: "Missing paymentId" });
-    }
-
-    const [payment] = await db
-      .select()
-      .from(payments)
-      .where(eq(payments.providerReference, paymentId));
-
-    if (!payment) {
-      return res.status(404).json({ error: "Payment not found" });
-    }
-
-    // ✅ Sandbox vs Production handling
+    // ✅ Sandbox does NOT require txid
     if (process.env.PI_ENV === "sandbox") {
       await pi.post(`/payments/${paymentId}/complete`);
     } else {
-      if (!txid) {
-        return res.status(400).json({ error: "Missing txid in production" });
-      }
       await pi.post(`/payments/${paymentId}/complete`, { txid });
     }
 
@@ -134,15 +110,14 @@ router.post("/complete", async (req, res) => {
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("❌ COMPLETE FAILED:", err.response?.data || err.message);
+    console.error("❌ Complete failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Complete failed" });
   }
 });
 
 /*
 ──────────────────────────────────────────
-4️⃣ WEBHOOK (SAFETY NET)
-Pi → Backend
+4️⃣ WEBHOOK (FAILSAFE)
 ──────────────────────────────────────────
 */
 router.post("/webhook", express.json({ type: "*/*" }), async (req, res) => {
@@ -159,17 +134,12 @@ router.post("/webhook", express.json({ type: "*/*" }), async (req, res) => {
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("❌ WEBHOOK ERROR:", err);
+    console.error("❌ Webhook error:", err.message);
     res.status(500).json({ error: "Webhook failed" });
   }
 });
 
-/*
-──────────────────────────────────────────
-DEBUG (SAFE TO KEEP)
-──────────────────────────────────────────
-*/
 console.log("🔑 PI_ENV:", process.env.PI_ENV);
-console.log("🔑 PI_API_KEY exists:", !!process.env.PI_API_KEY);
+console.log("🔑 PI_API_KEY loaded:", !!process.env.PI_API_KEY);
 
 export default router;
